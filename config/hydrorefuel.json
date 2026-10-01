@@ -55,6 +55,18 @@
     "queue": {
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
+    },
+    "reconciliation": {
+      "settlement": "shift",
+      "default_team": "A",
+      "mass_tolerance_kg": 0.5,
+      "pressure_tolerance_mpa": 1.5,
+      "kg_per_mpa": 8.0,
+      "expected_pressure_mpa": 42.0,
+      "policies": [
+        {"team": "A", "large_threshold_kg": 5.0, "on_large": "hold"},
+        {"team": "B", "large_threshold_kg": 5.0, "on_large": "continue"}
+      ]
     }
   }
 }

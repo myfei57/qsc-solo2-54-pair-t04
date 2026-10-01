@@ -275,6 +275,73 @@ class QueueLimits:
 
 
 @dataclass(frozen=True)
+class ReconciliationPolicy:
+    """班组大额差异处理策略。"""
+
+    team: str
+    large_threshold_kg: float
+    on_large: str
+
+
+@dataclass(frozen=True)
+class ReconciliationLimits:
+    """瓶组气量班结对账口径与班组策略。"""
+
+    settlement: str
+    default_team: str
+    mass_tolerance_kg: float
+    pressure_tolerance_mpa: float
+    kg_per_mpa: float
+    expected_pressure_mpa: float
+    policies: tuple[ReconciliationPolicy, ...]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "ReconciliationLimits":
+        settlement = str(section.get("settlement", "shift"))
+        if settlement != "shift":
+            raise ConfigError("瓶组对账结算口径已固定为班结，不允许按日结", component="config")
+        default_team = section.get("default_team")
+        if not isinstance(default_team, str) or not default_team:
+            raise ConfigError("对账默认班组必须是非空字符串", component="config")
+        raw_policies = section.get("policies")
+        if not isinstance(raw_policies, list) or not raw_policies:
+            raise ConfigError("对账班组策略至少配置一个班组", component="config")
+        policies: list[ReconciliationPolicy] = []
+        teams: set[str] = set()
+        for item in raw_policies:
+            if not isinstance(item, Mapping):
+                raise ConfigError("对账班组策略必须是对象列表", component="config")
+            team = item.get("team")
+            if not isinstance(team, str) or not team:
+                raise ConfigError("对账班组名称必须是非空字符串", component="config")
+            if team in teams:
+                raise ConfigError(f"对账班组策略重复: {team}", component="config")
+            threshold = _number(item, "large_threshold_kg", minimum=0.0)
+            on_large = str(item.get("on_large", "hold"))
+            if on_large not in ("hold", "continue"):
+                raise ConfigError("大额差异策略只能是 hold 或 continue", component="config")
+            policies.append(ReconciliationPolicy(team, threshold, on_large))
+            teams.add(team)
+        if default_team not in teams:
+            raise ConfigError("对账默认班组必须在班组策略中", component="config")
+        return cls(
+            settlement="shift",
+            default_team=default_team,
+            mass_tolerance_kg=_number(section, "mass_tolerance_kg", minimum=0.0),
+            pressure_tolerance_mpa=_number(section, "pressure_tolerance_mpa", minimum=0.0),
+            kg_per_mpa=_number(section, "kg_per_mpa", minimum=0.0001),
+            expected_pressure_mpa=_number(section, "expected_pressure_mpa", minimum=1.0),
+            policies=tuple(policies),
+        )
+
+    def policy_mapping(self) -> list[dict]:
+        return [
+            {"team": item.team, "large_threshold_kg": item.large_threshold_kg, "on_large": item.on_large}
+            for item in self.policies
+        ]
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """一份完整的平台配置。"""
 
@@ -289,6 +356,7 @@ class StationConfig:
     dispenser: DispenserLimits
     leak: LeakLimits
     queue: QueueLimits
+    reconciliation: ReconciliationLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -313,6 +381,7 @@ class StationConfig:
             dispenser=DispenserLimits.from_mapping(_section(limits, "disp")),
             leak=LeakLimits.from_mapping(_section(limits, "leak")),
             queue=QueueLimits.from_mapping(_section(limits, "queue")),
+            reconciliation=ReconciliationLimits.from_mapping(_section(limits, "reconciliation")),
         )
 
 
@@ -343,6 +412,18 @@ def default_config() -> StationConfig:
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
         queue=QueueLimits(12, 45.0),
+        reconciliation=ReconciliationLimits(
+            settlement="shift",
+            default_team="A",
+            mass_tolerance_kg=0.5,
+            pressure_tolerance_mpa=1.5,
+            kg_per_mpa=8.0,
+            expected_pressure_mpa=42.0,
+            policies=(
+                ReconciliationPolicy("A", 5.0, "hold"),
+                ReconciliationPolicy("B", 5.0, "continue"),
+            ),
+        ),
     )
 
 
@@ -403,6 +484,15 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+            },
+            "reconciliation": {
+                "settlement": cfg.reconciliation.settlement,
+                "default_team": cfg.reconciliation.default_team,
+                "mass_tolerance_kg": cfg.reconciliation.mass_tolerance_kg,
+                "pressure_tolerance_mpa": cfg.reconciliation.pressure_tolerance_mpa,
+                "kg_per_mpa": cfg.reconciliation.kg_per_mpa,
+                "expected_pressure_mpa": cfg.reconciliation.expected_pressure_mpa,
+                "policies": cfg.reconciliation.policy_mapping(),
             },
         },
     }

@@ -40,6 +40,11 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
+from .recon.ledger import CHARGE as RECON_CHARGE
+from .recon.ledger import ISSUE as RECON_ISSUE
+from .recon.ledger import TeamPolicy
+from .recon.ledger import ReconciliationError, ReconciliationLedger
+from .recon.rules import MeasurementRule
 from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
@@ -70,6 +75,7 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.reconciliation = self._build_reconciliation(store)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -111,6 +117,39 @@ class Platform:
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
+        if not self.reconciliation.shifts():
+            # 交付后的运行对象必须处于可记账状态；跨重启若上一班已结则不自动开新班。
+            self.reconciliation.open_shift()
+
+    def _build_reconciliation(self, store: JsonStore) -> ReconciliationLedger:
+        """装配班结台账；配置只提供 R0001，后续口径只追加发布。"""
+
+        recon_cfg = self.config.reconciliation
+        rule = MeasurementRule(
+            version="R0001",
+            effective_ts=self.clock.now(),
+            settlement=recon_cfg.settlement,
+            mass_tolerance_kg=recon_cfg.mass_tolerance_kg,
+            pressure_tolerance_mpa=recon_cfg.pressure_tolerance_mpa,
+            kg_per_mpa=recon_cfg.kg_per_mpa,
+            expected_pressure_mpa=recon_cfg.expected_pressure_mpa,
+        )
+        policies = {
+            item.team: TeamPolicy(
+                team=item.team,
+                large_threshold_kg=item.large_threshold_kg,
+                on_large=item.on_large,
+            )
+            for item in recon_cfg.policies
+        }
+        return ReconciliationLedger(
+            store,
+            self.clock,
+            self.bus,
+            rule,
+            policies,
+            recon_cfg.default_team,
+        )
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -139,13 +178,34 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        pressure = (
+            float(state.get("bank_pressure_mpa", 0.0))
+            if isinstance(state, dict) and state.get("bank_pressure_mpa") is not None
+            else 0.0
+        )
+        report = self.reconciliation.current_report()
+        if report.get("active_shift_id") is None:
+            shifts = self.reconciliation.shifts()
+            stock = shifts[-1]["ending_stock_kg"] if shifts else 0.0
+            pressure = shifts[-1]["actual_pressure_mpa"] if shifts else pressure
+        else:
+            stock = report["book_stock_kg"]
+            if pressure == 0.0 and stock > 0.0:
+                pressure = self.reconciliation.rule.expected_pressure_mpa
+        self.bank.restore(pressure_mpa=pressure, stored_kg=stock)
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
 
         self.store.write(
             "platform_state",
-            {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
+            {
+                "operations": self._operations,
+                "cycles": self._cycles,
+                "unit": self.unit,
+                "bank_pressure_mpa": round(self.bank.pressure_mpa, 6),
+                "bank_stored_kg": round(self.bank.stored_kg, 6),
+            },
         )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
@@ -251,6 +311,8 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            pressure_before = self.bank.pressure_mpa
+            stored_before = self.bank.stored_kg
             report = pressurize_buffer(
                 self.compressor,
                 self.bank,
@@ -263,6 +325,36 @@ class Platform:
                 charge_kg=charge_kg,
                 dt=dt,
             )
+            if report["ok"]:
+                try:
+                    movement = self.reconciliation.post_movement(
+                        RECON_CHARGE,
+                        charge_kg,
+                        meter_id="compressor_discharge",
+                        pressure_before_mpa=pressure_before,
+                        pressure_after_mpa=self.bank.pressure_mpa,
+                        reference_id=op_id,
+                        note="压缩机充瓶",
+                    )
+                    if abs(self.bank.stored_kg - stored_before - charge_kg) > 1e-9:
+                        raise RuntimeError("充瓶流水与瓶组库存增量不一致")
+                except HydroError as error:
+                    self.note_error(error)
+                    report["ok"] = False
+                    report["violations"].append(f"recon:{error.as_record()['type']}")
+                    movement = None
+                if movement is not None:
+                    report["steps"].append(
+                        {
+                            "component": "recon",
+                            "action": "ledger_charge",
+                            "detail": {
+                                "movement_id": movement["movement_id"],
+                                "balance_kg": movement["balance_kg"],
+                                "rule_version": movement["rule_version"],
+                            },
+                        }
+                    )
             summary = self._record_operation(op_id, "pressurize", report)
             self._operations += 1
             self._persist()
@@ -285,6 +377,7 @@ class Platform:
                 self.note_error(error)
                 return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": ["line_pressure_high"]}
             before = self.meter.total_kg()
+            pressure_before = self.bank.pressure_mpa
             report = fill_vehicle(
                 self.dispenser,
                 self.nozzle,
@@ -301,8 +394,31 @@ class Platform:
                 dt=dt,
             )
             if report["ok"]:
+                drawn_kg = self.meter.total_kg() - before
                 try:
-                    self.bank.draw(self.meter.total_kg() - before)
+                    self.bank.draw(drawn_kg)
+                    movement = self.reconciliation.post_movement(
+                        RECON_ISSUE,
+                        drawn_kg,
+                        meter_id="dispenser_mass_meter",
+                        meter_reading_after=self.meter.total_kg(),
+                        pressure_before_mpa=pressure_before,
+                        pressure_after_mpa=self.bank.pressure_mpa,
+                        reference_id=op_id,
+                        note=f"加注 {vehicle}",
+                    )
+                    report["steps"].append(
+                        {
+                            "component": "recon",
+                            "action": "ledger_issue",
+                            "detail": {
+                                "movement_id": movement["movement_id"],
+                                "balance_kg": movement["balance_kg"],
+                                "meter_id": movement["meter_id"],
+                                "rule_version": movement["rule_version"],
+                            },
+                        }
+                    )
                 except HydroError as error:
                     self.note_error(error)
             summary = self._record_operation(op_id, "fill", report)
@@ -378,6 +494,156 @@ class Platform:
             "after_mpa": round(after, 3),
             "within_band": self.bank.within_band(),
         }
+
+    def open_reconciliation_shift(self, team: str | None = None) -> dict:
+        """开下一个班；上一班必须已结。"""
+
+        with self._lock:
+            return self.reconciliation.open_shift(team=team)
+
+    def close_reconciliation_shift(
+        self,
+        actual_pressure_mpa: float | None = None,
+        actual_stock_kg: float | None = None,
+    ) -> dict:
+        """按固定班结口径结当前班。大额差异按班组策略挂起或单列继续。"""
+
+        with self._lock:
+            pressure = self.bank.pressure_mpa if actual_pressure_mpa is None else actual_pressure_mpa
+            stock = self.bank.stored_kg if actual_stock_kg is None else actual_stock_kg
+            result = self.reconciliation.close_shift(pressure, actual_stock_kg=stock)
+            if result.get("state") == "closed":
+                # continue 策略下单列差异是授权调账，库存要承继盘点实物量到下一班。
+                self.bank.restore(
+                    pressure_mpa=result["actual_pressure_mpa"],
+                    stored_kg=result["ending_stock_kg"],
+                )
+            return result
+
+    def record_buffer_movement(
+        self,
+        direction: str,
+        mass_kg: float,
+        *,
+        meter_id: str = "manual",
+        meter_reading_after: float | None = None,
+        pressure_before_mpa: float | None = None,
+        pressure_after_mpa: float | None = None,
+        reading_id: str | None = None,
+        note: str = "",
+    ) -> dict:
+        """人工补录一笔完整计量的充瓶或取用，并同步瓶组库存。"""
+
+        with self._lock:
+            if direction not in (RECON_CHARGE, RECON_ISSUE):
+                raise ReconciliationError("人工流水只能登记充瓶或取用", component="recon")
+            pressure_before = self.bank.pressure_mpa
+            if reading_id is not None:
+                self.reconciliation.partial_reading(reading_id)
+            if reading_id is None and meter_reading_after is not None:
+                previous = self.reconciliation.last_meter_reading(meter_id)
+                baseline = 0.0 if previous is None else previous
+                observed = meter_reading_after - baseline
+                signed_observed = observed if direction == RECON_CHARGE else -observed
+                expected_signed = mass_kg if direction == RECON_CHARGE else -mass_kg
+                if abs(signed_observed - expected_signed) > self.reconciliation.rule.mass_tolerance_kg:
+                    return self.record_meter_partial_reading(
+                        direction=direction,
+                        meter_id=meter_id,
+                        meter_reading_after=meter_reading_after,
+                        reason="人工补录计量差额超过公差",
+                        previous_meter_reading=previous,
+                        estimated_mass_kg=mass_kg,
+                    )
+            if direction == RECON_CHARGE:
+                self.bank.fill(pressure_before if pressure_after_mpa is None else pressure_after_mpa, mass_kg)
+            else:
+                self.bank.draw(mass_kg)
+            return self.reconciliation.post_movement(
+                direction,
+                mass_kg,
+                meter_id=meter_id,
+                meter_reading_after=meter_reading_after,
+                pressure_before_mpa=pressure_before,
+                pressure_after_mpa=self.bank.pressure_mpa,
+                reading_id=reading_id,
+                note=note,
+            )
+
+    def record_meter_partial_reading(
+        self,
+        direction: str,
+        meter_id: str,
+        meter_reading_after: float | None,
+        reason: str,
+        *,
+        previous_meter_reading: float | None = None,
+        estimated_mass_kg: float | None = None,
+        reference_id: str | None = None,
+    ) -> dict:
+        """登记计量补读部分失败；估数只留痕，不入账。"""
+
+        with self._lock:
+            return self.reconciliation.record_partial_reading(
+                direction=direction,
+                meter_id=meter_id,
+                meter_reading_after=meter_reading_after,
+                previous_meter_reading=previous_meter_reading,
+                estimated_mass_kg=estimated_mass_kg,
+                reason=reason,
+                reference_id=reference_id,
+            )
+
+    def publish_measurement_rule(
+        self,
+        version: str,
+        mass_tolerance_kg: float,
+        pressure_tolerance_mpa: float,
+        kg_per_mpa: float,
+        expected_pressure_mpa: float = 42.0,
+    ) -> dict:
+        """发布新计量规则版本；已结班继续按旧版本解释。"""
+
+        with self._lock:
+            return self.reconciliation.publish_rule(
+                version=version,
+                mass_tolerance_kg=mass_tolerance_kg,
+                pressure_tolerance_mpa=pressure_tolerance_mpa,
+                kg_per_mpa=kg_per_mpa,
+                expected_pressure_mpa=expected_pressure_mpa,
+            )
+
+    def set_reconciliation_team_policy(self, team: str, large_threshold_kg: float, on_large: str) -> dict:
+        """配置班组大额差异是整班挂起还是单列继续。"""
+
+        with self._lock:
+            return self.reconciliation.set_team_policy(team, large_threshold_kg, on_large)
+
+    def reconciliation_report(self, include_actual: bool = False) -> dict:
+        """当前班收发存报表，供控制台展示。"""
+
+        with self._lock:
+            return self.reconciliation.current_report(
+                actual_pressure_mpa=self.bank.pressure_mpa if include_actual else None
+            )
+
+    def reconciliation_movements(self, shift_id: str | None = None, limit: int | None = None) -> dict:
+        return {"settlement": "shift", "movements": self.reconciliation.movements(shift_id=shift_id, limit=limit)}
+
+    def reconciliation_shifts(self) -> dict:
+        return {"settlement": "shift", "shifts": self.reconciliation.shifts()}
+
+    def reconciliation_readings(self, shift_id: str | None = None) -> dict:
+        return {"readings": self.reconciliation.readings(shift_id=shift_id)}
+
+    def verify_reconciliation(self) -> dict:
+        """核对库存、流水与审计三处一致性。"""
+
+        with self._lock:
+            return self.reconciliation.verify(
+                audit_journal=self.audit.journal,
+                bank_stored_kg=self.bank.stored_kg,
+            )
 
     def enqueue_vehicle(self, vehicle: str) -> dict:
         """把车辆加入加注队列，返回排队位次。"""
@@ -525,6 +791,7 @@ class Platform:
             self.truck.reset()
             self.compressor.reset()
             self.bank.reset()
+            self.reconciliation.reset()
             self.temperature.reset()
             self.precooler.reset()
             self.meter.reset()
@@ -532,6 +799,7 @@ class Platform:
             self.dispenser.reset()
             self.queue.reset()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
+            self.reconciliation.open_shift()
             self._operations = 0
             self._cycles = 0
             return {"platform_state_removed": removed, "store_root": self.store.root}
@@ -656,6 +924,7 @@ class Platform:
             "vent": self.vent_snapshot(),
             "compressor": self.compressor_snapshot(),
             "buffer": self.buffer_snapshot(),
+            "reconciliation": self.reconciliation.snapshot(),
             "cool": self.cool_snapshot(),
             "flow": self.flow_snapshot(),
             "disp": self.disp_snapshot(),

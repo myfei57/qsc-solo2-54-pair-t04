@@ -79,3 +79,13 @@ class BufferBank:
 
         self._pressure_mpa = 0.0
         self._stored_kg = 0.0
+
+    def restore(self, pressure_mpa: float = 0.0, stored_kg: float = 0.0) -> None:
+        """从持久化台账恢复瓶组压力与存量。"""
+
+        pressure = float(pressure_mpa)
+        stored = float(stored_kg)
+        if pressure < 0 or stored < 0:
+            raise ValueError("恢复的压力和存量不能为负")
+        self._pressure_mpa = pressure
+        self._stored_kg = stored

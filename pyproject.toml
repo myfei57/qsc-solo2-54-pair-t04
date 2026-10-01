@@ -27,4 +27,5 @@ packages = [
     "hydrorefuel.queue",
     "hydrorefuel.sequence",
     "hydrorefuel.console",
+    "hydrorefuel.recon",
 ]
