@@ -17,6 +17,17 @@ from .errors import ConfigError
 
 _MISSING = object()
 
+# 缺省对账段：未配置 recon 时使用的内置口径（仍可被显式配置整体覆盖）。
+DEFAULT_RECON_SECTION = {
+    "settle_by": "shift",
+    "pressure_factor_kg_per_mpa": 5.0,
+    "deadband_kg": 0.5,
+    "tolerance_kg": 1.5,
+    "material_kg": 3.0,
+    "default_policy": "hold",
+    "opening_stock_kg": 0.0,
+}
+
 
 def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = mapping.get(key)
@@ -275,6 +286,46 @@ class QueueLimits:
 
 
 @dataclass(frozen=True)
+class ReconciliationLimits:
+    """瓶组对账口径与差异容差约束。
+
+    结班粒度写死为按班结（``settle_by`` 只接受 ``"shift"``），日盘点只是把
+    已结班首尾相拼，绝不另立结算边界。计量规则按版本冻结：本班开班时用的是
+    哪一版，收、发、存与差异就按那一版解释，规则换版只影响之后开的班。
+    """
+
+    settle_by: str
+    pressure_factor_kg_per_mpa: float
+    deadband_kg: float
+    tolerance_kg: float
+    material_kg: float
+    default_policy: str
+    opening_stock_kg: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "ReconciliationLimits":
+        settle_by = str(section.get("settle_by", "shift"))
+        if settle_by != "shift":
+            raise ConfigError("对账结班粒度只支持按班结 'shift'，不按日结", component="config")
+        default_policy = str(section.get("default_policy", "hold"))
+        if default_policy not in ("hold", "isolate"):
+            raise ConfigError("班组差异策略只能是 'hold'（整班挂起）或 'isolate'（单列差异续结）", component="config")
+        limits = cls(
+            settle_by=settle_by,
+            pressure_factor_kg_per_mpa=_number(section, "pressure_factor_kg_per_mpa", minimum=0.0),
+            deadband_kg=_number(section, "deadband_kg", minimum=0.0),
+            tolerance_kg=_number(section, "tolerance_kg", minimum=0.0),
+            material_kg=_number(section, "material_kg", minimum=0.0),
+            default_policy=default_policy,
+            opening_stock_kg=_number(section, "opening_stock_kg", minimum=0.0),
+        )
+        if not limits.deadband_kg <= limits.tolerance_kg <= limits.material_kg:
+            raise ConfigError("对账容差必须满足 deadband <= tolerance <= material", component="config")
+        return limits
+
+
+
+@dataclass(frozen=True)
 class StationConfig:
     """一份完整的平台配置。"""
 
@@ -289,6 +340,7 @@ class StationConfig:
     dispenser: DispenserLimits
     leak: LeakLimits
     queue: QueueLimits
+    recon: ReconciliationLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "StationConfig":
@@ -301,6 +353,13 @@ class StationConfig:
             raise ConfigError("station.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        if "recon" not in limits:
+            recon_section = dict(DEFAULT_RECON_SECTION)
+        else:
+            raw_recon = limits["recon"]
+            if raw_recon is None or not isinstance(raw_recon, Mapping):
+                raise ConfigError("配置段落 'recon' 必须是映射", component="config")
+            recon_section = dict(raw_recon)
         return cls(
             name=name,
             storage_root=storage_root,
@@ -313,6 +372,7 @@ class StationConfig:
             dispenser=DispenserLimits.from_mapping(_section(limits, "disp")),
             leak=LeakLimits.from_mapping(_section(limits, "leak")),
             queue=QueueLimits.from_mapping(_section(limits, "queue")),
+            recon=ReconciliationLimits.from_mapping(dict(recon_section)),
         )
 
 
@@ -343,6 +403,15 @@ def default_config() -> StationConfig:
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
         queue=QueueLimits(12, 45.0),
+        recon=ReconciliationLimits(
+            settle_by="shift",
+            pressure_factor_kg_per_mpa=5.0,
+            deadband_kg=0.5,
+            tolerance_kg=1.5,
+            material_kg=3.0,
+            default_policy="hold",
+            opening_stock_kg=0.0,
+        ),
     )
 
 
@@ -403,6 +472,15 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+            },
+            "recon": {
+                "settle_by": cfg.recon.settle_by,
+                "pressure_factor_kg_per_mpa": cfg.recon.pressure_factor_kg_per_mpa,
+                "deadband_kg": cfg.recon.deadband_kg,
+                "tolerance_kg": cfg.recon.tolerance_kg,
+                "material_kg": cfg.recon.material_kg,
+                "default_policy": cfg.recon.default_policy,
+                "opening_stock_kg": cfg.recon.opening_stock_kg,
             },
         },
     }

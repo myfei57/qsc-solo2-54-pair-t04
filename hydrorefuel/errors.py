@@ -53,3 +53,7 @@ class ConfigError(HydroError):
 
 class NamespaceError(HydroError):
     """命名空间重复注册或解析失败。"""
+
+
+class ReconciliationError(HydroError):
+    """对账动作不满足条件（无开班、计量补读失败、班已结冻等）。"""

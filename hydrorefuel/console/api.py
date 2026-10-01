@@ -57,6 +57,24 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/recon/stock", lambda params, body: self._platform.recon_stock())
+        add("GET", "/api/recon/entries", self._recon_entries)
+        add("GET", "/api/recon/entry/{entry_id}", self._recon_entry)
+        add("GET", "/api/recon/shifts", self._recon_shifts)
+        add("GET", "/api/recon/shift/{shift_id}", self._recon_shift)
+        add("GET", "/api/recon/rules", lambda params, body: self._platform.recon_rules())
+        add("GET", "/api/recon/journal", lambda params, body: self._platform.recon_journal())
+        add("GET", "/api/recon/consistency", lambda params, body: self._platform.recon_consistency())
+        add("POST", "/api/recon/shift/open", self._recon_open)
+        add("POST", "/api/recon/shift/close", self._recon_close)
+        add("POST", "/api/recon/policy", self._recon_policy)
+        add("POST", "/api/recon/charge", self._recon_charge)
+        add("POST", "/api/recon/draw", self._recon_draw)
+        add("POST", "/api/recon/pending", self._recon_pending)
+        add("POST", "/api/recon/reading", self._recon_reading)
+        add("POST", "/api/recon/reading/fail", self._recon_reading_fail)
+        add("POST", "/api/recon/verify", self._recon_verify)
+        add("POST", "/api/recon/rules", self._recon_register_rule)
         add("POST", "/api/step", self._step)
         add("POST", "/api/unload", self._unload)
         add("POST", "/api/pressurize", self._pressurize)
@@ -184,3 +202,92 @@ class Api:
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))
+
+    # -------------------------------------------------------------- 瓶组对账
+
+    def _recon_entries(self, params: dict, body: dict) -> dict:
+        shift_id = params.get("shift")
+        return self._platform.recon_entries(shift_id=shift_id)
+
+    def _recon_entry(self, params: dict, body: dict) -> dict:
+        return {"entry": self._platform.recon_entry(str(params.get("entry_id", "")))}
+
+    def _recon_shift(self, params: dict, body: dict) -> dict:
+        return {"shift": self._platform.recon_shift(str(params.get("shift_id", "")))}
+
+    def _recon_shifts(self, params: dict, body: dict) -> dict:
+        state = params.get("state")
+        return self._platform.recon_shifts(state=state)
+
+    def _recon_open(self, params: dict, body: dict) -> dict:
+        opening = body.get("opening_kg")
+        return self._platform.recon_open_shift(
+            crew=str(body.get("crew", "unassigned")),
+            opening_kg=None if opening is None else _as_float(body, "opening_kg", 0.0),
+        )
+
+    def _recon_close(self, params: dict, body: dict) -> dict:
+        return self._platform.recon_close_shift(_as_float(body, "physical_pressure_mpa", 0.0))
+
+    def _recon_policy(self, params: dict, body: dict) -> dict:
+        return self._platform.recon_set_policy(str(body.get("crew", "")), str(body.get("policy", "")))
+
+    def _recon_charge(self, params: dict, body: dict) -> dict:
+        before = body.get("pressure_before_mpa")
+        after = body.get("pressure_after_mpa")
+        return self._platform.recon_charge(
+            _as_float(body, "qty_kg", 0.0),
+            operator=str(body.get("operator", "")),
+            meter_ref=str(body.get("meter_ref", "")),
+            pressure_before_mpa=None if before is None else float(before),
+            pressure_after_mpa=None if after is None else float(after),
+        )
+
+    def _recon_draw(self, params: dict, body: dict) -> dict:
+        before = body.get("pressure_before_mpa")
+        after = body.get("pressure_after_mpa")
+        return self._platform.recon_draw(
+            _as_float(body, "qty_kg", 0.0),
+            operator=str(body.get("operator", "")),
+            meter_ref=str(body.get("meter_ref", "")),
+            pressure_before_mpa=None if before is None else float(before),
+            pressure_after_mpa=None if after is None else float(after),
+        )
+
+    def _recon_pending(self, params: dict, body: dict) -> dict:
+        kind = str(body.get("kind", ""))
+        if kind not in ("charge", "draw"):
+            raise HydroError("kind 必须是 charge 或 draw", component="console")
+        return self._platform.recon_pending(
+            kind,
+            operator=str(body.get("operator", "")),
+            meter_ref=str(body.get("meter_ref", "")),
+            note=str(body.get("note", "")),
+        )
+
+    def _recon_reading(self, params: dict, body: dict) -> dict:
+        return self._platform.recon_supply_reading(
+            str(body.get("entry_id", "")),
+            _as_float(body, "qty_kg", 0.0),
+            meter_ref=str(body.get("meter_ref", "")),
+        )
+
+    def _recon_reading_fail(self, params: dict, body: dict) -> dict:
+        return self._platform.recon_fail_reading(
+            str(body.get("entry_id", "")), str(body.get("reason", "读数失败"))
+        )
+
+    def _recon_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.recon_verify_entry(
+            str(body.get("entry_id", "")), _as_float(body, "verified_delta_kg", 0.0)
+        )
+
+    def _recon_register_rule(self, params: dict, body: dict) -> dict:
+        return self._platform.recon_register_rule(
+            version=str(body.get("version", "")),
+            pressure_factor_kg_per_mpa=_as_float(body, "pressure_factor_kg_per_mpa", 5.0),
+            deadband_kg=_as_float(body, "deadband_kg", 0.5),
+            tolerance_kg=_as_float(body, "tolerance_kg", 1.5),
+            material_kg=_as_float(body, "material_kg", 3.0),
+            note=str(body.get("note", "")),
+        )

@@ -55,6 +55,15 @@
     "queue": {
       "max_waiting": 12,
       "confirm_timeout_s": 45.0
+    },
+    "recon": {
+      "settle_by": "shift",
+      "pressure_factor_kg_per_mpa": 5.0,
+      "deadband_kg": 0.5,
+      "tolerance_kg": 1.5,
+      "material_kg": 3.0,
+      "default_policy": "hold",
+      "opening_stock_kg": 0.0
     }
   }
 }

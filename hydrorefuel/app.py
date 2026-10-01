@@ -40,6 +40,7 @@ from .ns.topology import Topology, build_default_topology
 from .queue.confirm import Confirmation
 from .queue.queue import FillQueue
 from .queue.snapshot import QueueSnapshot
+from .recon.ledger import DEFAULT_CREW, ReconciliationLedger
 from .sequence import fill_vehicle, pressurize_buffer, stop_fill, unload_truck
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
@@ -70,6 +71,7 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.recon = ReconciliationLedger(self.config.recon, self.clock, self.bus, store)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -139,6 +141,9 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        # 首装：写入初始计量规则并自动开一个默认班，保证每笔充取都有班可记。
+        self.recon.seed_rules()
+        self.recon.ensure_open_shift(DEFAULT_CREW)
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -251,6 +256,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            pressure_before = self.bank.pressure_mpa
             report = pressurize_buffer(
                 self.compressor,
                 self.bank,
@@ -263,6 +269,17 @@ class Platform:
                 charge_kg=charge_kg,
                 dt=dt,
             )
+            if report["ok"]:
+                # 充瓶成功即按实际入账气量记一笔"收"，并带上充前/充后压力。
+                self.recon.ensure_open_shift(DEFAULT_CREW)
+                self.recon.record_charge(
+                    float(charge_kg),
+                    operator=self.unit,
+                    meter_ref="compressor",
+                    pressure_before_mpa=round(pressure_before, 3),
+                    pressure_after_mpa=round(self.bank.pressure_mpa, 3),
+                    op_id=op_id,
+                )
             summary = self._record_operation(op_id, "pressurize", report)
             self._operations += 1
             self._persist()
@@ -285,6 +302,7 @@ class Platform:
                 self.note_error(error)
                 return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": ["line_pressure_high"]}
             before = self.meter.total_kg()
+            pressure_before = self.bank.pressure_mpa
             report = fill_vehicle(
                 self.dispenser,
                 self.nozzle,
@@ -301,10 +319,22 @@ class Platform:
                 dt=dt,
             )
             if report["ok"]:
+                drawn_kg = self.meter.total_kg() - before
                 try:
-                    self.bank.draw(self.meter.total_kg() - before)
+                    self.bank.draw(drawn_kg)
                 except HydroError as error:
                     self.note_error(error)
+                else:
+                    # 加注成功即按质量流量计实测记一笔"发"，带上取前/取后压力。
+                    self.recon.ensure_open_shift(DEFAULT_CREW)
+                    self.recon.record_draw(
+                        round(drawn_kg, 6),
+                        operator=vehicle,
+                        meter_ref="mass_flow_meter",
+                        pressure_before_mpa=round(pressure_before, 3),
+                        pressure_after_mpa=round(self.bank.pressure_mpa, 3),
+                        op_id=op_id,
+                    )
             summary = self._record_operation(op_id, "fill", report)
             self._operations += 1
             self._persist()
@@ -394,6 +424,163 @@ class Platform:
             vehicle = self.queue.dequeue()
             self.confirm.open(vehicle, self.clock.now())
             return {"vehicle": vehicle, "size": self.queue.size(), "position": self.queue.position(vehicle)}
+
+    # -------------------------------------------------------------- 瓶组对账
+
+    def recon_open_shift(self, crew: str = DEFAULT_CREW, opening_kg: float | None = None) -> dict:
+        """开班（按班结），锁定当时计量规则版本与班组差异策略。"""
+
+        with self._lock:
+            return self.recon.open_shift(crew=crew, opening_kg=opening_kg)
+
+    def recon_close_shift(self, physical_pressure_mpa: float) -> dict:
+        """盘点结班：按当班规则换算实存，算收发存、差异与处置。"""
+
+        with self._lock:
+            return self.recon.close_shift(physical_pressure_mpa)
+
+    def recon_set_policy(self, crew: str, policy: str) -> dict:
+        """按班组设定差异偏大处置：hold 整班挂起 / isolate 单列差异续结。"""
+
+        with self._lock:
+            return self.recon.set_crew_policy(crew, policy)
+
+    def recon_charge(
+        self,
+        qty_kg: float,
+        operator: str = "",
+        meter_ref: str = "",
+        pressure_before_mpa: float | None = None,
+        pressure_after_mpa: float | None = None,
+    ) -> dict:
+        """手工补登一笔充瓶（收）。"""
+
+        with self._lock:
+            self.recon.ensure_open_shift(DEFAULT_CREW)
+            return self.recon.record_charge(
+                qty_kg,
+                operator=operator,
+                meter_ref=meter_ref,
+                pressure_before_mpa=pressure_before_mpa,
+                pressure_after_mpa=pressure_after_mpa,
+            )
+
+    def recon_draw(
+        self,
+        qty_kg: float,
+        operator: str = "",
+        meter_ref: str = "",
+        pressure_before_mpa: float | None = None,
+        pressure_after_mpa: float | None = None,
+    ) -> dict:
+        """手工补登一笔取用（发）。"""
+
+        with self._lock:
+            self.recon.ensure_open_shift(DEFAULT_CREW)
+            return self.recon.record_draw(
+                qty_kg,
+                operator=operator,
+                meter_ref=meter_ref,
+                pressure_before_mpa=pressure_before_mpa,
+                pressure_after_mpa=pressure_after_mpa,
+            )
+
+    def recon_pending(self, kind: str, operator: str = "", meter_ref: str = "", note: str = "") -> dict:
+        """计量读数缺失/失败：挂待补读，不按估数入账（部分失败）。"""
+
+        with self._lock:
+            self.recon.ensure_open_shift(DEFAULT_CREW)
+            return self.recon.record_pending(kind, operator=operator, meter_ref=meter_ref, note=note)
+
+    def recon_supply_reading(self, entry_id: str, qty_kg: float, meter_ref: str = "") -> dict:
+        """补读实际读数后入账。"""
+
+        with self._lock:
+            return self.recon.supply_reading(entry_id, qty_kg, meter_ref=meter_ref)
+
+    def recon_fail_reading(self, entry_id: str, reason: str) -> dict:
+        """补读再次失败：保持待补读、不按估数入账。"""
+
+        with self._lock:
+            return self.recon.fail_reading(entry_id, reason)
+
+    def recon_verify_entry(self, entry_id: str, verified_delta_kg: float) -> dict:
+        """登记某笔流水的复核实测量，供差异逐笔定位。"""
+
+        with self._lock:
+            return self.recon.verify_entry(entry_id, verified_delta_kg)
+
+    def recon_entries(self, shift_id: str | None = None) -> dict:
+        """返回气账流水。"""
+
+        with self._lock:
+            return {"entries": self.recon.entries(shift_id)}
+
+    def recon_entry(self, entry_id: str) -> dict:
+        """返回单笔气账流水。"""
+
+        with self._lock:
+            return self.recon.get_entry(entry_id)
+
+    def recon_shift(self, shift_id: str) -> dict:
+        """返回单个班次（含结班报告）。"""
+
+        with self._lock:
+            return self.recon.get_shift(shift_id)
+
+    def recon_shifts(self, state: str | None = None) -> dict:
+        """返回班次（含已结班的收发存与差异报告）。"""
+
+        with self._lock:
+            return {"shifts": self.recon.shifts(state)}
+
+    def recon_rules(self) -> dict:
+        """返回计量规则版本册。"""
+
+        with self._lock:
+            return {"rules": self.recon.rules()}
+
+    def recon_register_rule(
+        self,
+        version: str,
+        pressure_factor_kg_per_mpa: float,
+        deadband_kg: float,
+        tolerance_kg: float,
+        material_kg: float,
+        note: str = "",
+    ) -> dict:
+        """登记一版新生效计量规则（只影响之后开的班）。"""
+
+        with self._lock:
+            return self.recon.register_rule(
+                version,
+                pressure_factor_kg_per_mpa,
+                deadband_kg,
+                tolerance_kg,
+                material_kg,
+                note=note,
+            )
+
+    def recon_stock(self) -> dict:
+        """收、发、存汇总，供控制台展示。"""
+
+        with self._lock:
+            return self.recon.stock_report()
+
+    def recon_journal(self) -> dict:
+        """回放对账流水（含哈希链）。"""
+
+        with self._lock:
+            return {"records": self.recon.journal_records()}
+
+    def recon_consistency(self) -> dict:
+        """核对库存、流水、审计三处一致性。
+
+        审计以落盘流水为准（跨重启也能核对），内存副本只服务控制台实时展示。
+        """
+
+        with self._lock:
+            return self.recon.consistency_check(self.audit.replay_from_journal())
 
     def namespace(self, address: str) -> dict:
         """按地址解析现场设备。"""
@@ -531,9 +718,13 @@ class Platform:
             self.leak.reset()
             self.dispenser.reset()
             self.queue.reset()
+            self.recon.reset()
             removed = self.store.remove("platform_state") if self.store.exists("platform_state") else False
             self._operations = 0
             self._cycles = 0
+            # 重置后重新写入初始规则并开默认班，保持与首装一致的可用状态。
+            self.recon.seed_rules()
+            self.recon.ensure_open_shift(DEFAULT_CREW)
             return {"platform_state_removed": removed, "store_root": self.store.root}
 
     def truck_snapshot(self) -> dict:
@@ -668,6 +859,7 @@ class Platform:
             "confirm_timeout_s": self.confirm.timeout_s,
             "leak_samples": self.leak.samples(),
             "last_audit_ts": self._last_audit_ts,
+            "recon": self.recon_stock(),
             "audit": self.audit.summary(),
         }
 
